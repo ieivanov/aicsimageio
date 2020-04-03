@@ -11,13 +11,13 @@ authors:
     orcid: 0000-0003-2564-0373
     affiliation: 1
   - name: Jamie Sherman
-    orcid: {PLEASE LET ME KNOW}
+    orcid: 0000-0003-2564-0373
     affiliation: 1
   - name: Madison Bowden
-    orcid: {PLEASE LET ME KNOW}
+    orcid: 0000-0003-2564-0373
     affiliation: 2
   - name: Daniel Toloudis
-    orcid: {PLEAST LET ME KNOW}
+    orcid: 0000-0003-2564-0373
     affiliation: 1
 
 affiliations:
