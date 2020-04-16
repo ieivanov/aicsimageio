@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import dask.array as da
 import numpy as np
+from s3fs import S3File
 
 from .. import exceptions, types
 from ..constants import Dimensions
@@ -27,7 +28,7 @@ class Reader(ABC):
     _metadata = None
 
     @staticmethod
-    def _resolve_image_path(img: Union[str, Path]) -> Path:
+    def _resolve_image_path(img: Union[str, Path, S3File]) -> Union[Path, S3File]:
         # Convert pathlike to Path
         if isinstance(img, (str, Path)):
             # Strictly do not fully resolve the path because Mac is bad with mounted drives
@@ -45,13 +46,14 @@ class Reader(ABC):
                 )
 
         # Check that no other type was provided
-        if not isinstance(img, Path):
+        if not isinstance(img, (S3File, Path)):
             raise TypeError(
                 f"Please provide a path to a file as a string, or an pathlib.Path, to the "
                 f"`img` parameter. "
                 f"Received type: {type(img)}"
             )
 
+        # An S3File has already been validated on initialization so no need to check
         return img
 
     def __init__(self, file: types.ImageLike, dask_kwargs: Dict[str, Any] = {}, **kwargs):
@@ -85,6 +87,11 @@ class Reader(ABC):
 
             # Return and close the open pointer
             with open(f, "rb") as read_bytes:
+                return cls._is_this_type(read_bytes)
+
+        # Check s3file
+        if isinstance(data, S3File):
+            with data.fs.open(data.path, "rb") as read_bytes:
                 return cls._is_this_type(read_bytes)
 
         # Convert bytes to BytesIO
