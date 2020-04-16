@@ -4,11 +4,12 @@
 import io
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import dask.array as da
 import numpy as np
 from dask import delayed
+from s3fs import S3File
 from tifffile import TiffFile
 
 from .. import exceptions, types
@@ -92,6 +93,56 @@ class TiffReader(Reader):
             # Return numpy
             return page.asarray()
 
+    @staticmethod
+    def _construct_dask_array(tiff: TiffFile) -> da.core.Array:
+        # Check each scene has the same shape
+        # If scene shape checking fails, use the specified scene and update operating shape
+        scenes = tiff.series
+        operating_shape = scenes[0].shape
+        for scene in scenes:
+            if scene.shape != operating_shape:
+                operating_shape = scenes[self.specific_s_index].shape
+                scenes = [scenes[self.specific_s_index]]
+                log.info(
+                    f"File contains variable dimensions per scene, "
+                    f"selected scene: {self.specific_s_index} for data retrieval."
+                )
+                break
+
+        # Get sample yx plane
+        sample = scenes[0].pages[0].asarray()
+
+        # Combine length of scenes and operating shape
+        # Replace YX dims with empty dimensions
+        operating_shape = (len(scenes), *operating_shape)
+        operating_shape = operating_shape[:-2] + (1, 1)
+
+        # Make ndarray for lazy arrays to fill
+        lazy_arrays = np.ndarray(operating_shape, dtype=object)
+        for all_page_index, (np_index, _) in enumerate(np.ndenumerate(lazy_arrays)):
+            # Scene index is the first index in np_index
+            scene_index = np_index[0]
+
+            # This page index is current enumeration divided by scene index + 1
+            # For example if the image has 10 Z slices and 5 scenes, there would be 50 total pages
+            this_page_index = all_page_index // (scene_index + 1)
+
+            # Fill the numpy array with the delayed arrays
+            lazy_arrays[np_index] = da.from_delayed(
+                delayed(TiffReader._imread)(self._file, scene_index, this_page_index),
+                shape=sample.shape,
+                dtype=sample.dtype
+            )
+
+        # Convert the numpy array of lazy readers into a dask array
+        data = da.block(lazy_arrays.tolist())
+
+        # Only return the scene dimension if multiple scenes are present
+        if len(scenes) == 1:
+            data = data[0, :]
+
+        return data
+
     @property
     def dask_data(self) -> da.core.Array:
         """
@@ -103,56 +154,16 @@ class TiffReader(Reader):
             The constructed delayed YX plane dask array.
         """
         if self._dask_data is None:
-            # Load Tiff
-            with TiffFile(self._file) as tiff:
-                # Check each scene has the same shape
-                # If scene shape checking fails, use the specified scene and update operating shape
-                scenes = tiff.series
-                operating_shape = scenes[0].shape
-                for scene in scenes:
-                    if scene.shape != operating_shape:
-                        operating_shape = scenes[self.specific_s_index].shape
-                        scenes = [scenes[self.specific_s_index]]
-                        log.info(
-                            f"File contains variable dimensions per scene, "
-                            f"selected scene: {self.specific_s_index} for data retrieval."
-                        )
-                        break
+            # Load remote Tiff scenes
+            if isinstance(self._file, S3File):
+                with self._file.fs.open(self._file.path, "rb") as read_bytes:
+                    with TiffFile(read_bytes) as tiff:
+                        self._dask_data = self._construct_dask_array(tiff)
 
-                # Get sample yx plane
-                sample = scenes[0].pages[0].asarray()
-
-                # Combine length of scenes and operating shape
-                # Replace YX dims with empty dimensions
-                operating_shape = (len(scenes), *operating_shape)
-                operating_shape = operating_shape[:-2] + (1, 1)
-
-                # Make ndarray for lazy arrays to fill
-                lazy_arrays = np.ndarray(operating_shape, dtype=object)
-                for all_page_index, (np_index, _) in enumerate(np.ndenumerate(lazy_arrays)):
-                    # Scene index is the first index in np_index
-                    scene_index = np_index[0]
-
-                    # This page index is current enumeration divided by scene index + 1
-                    # For example if the image has 10 Z slices and 5 scenes, there would be 50 total pages
-                    this_page_index = all_page_index // (scene_index + 1)
-
-                    # Fill the numpy array with the delayed arrays
-                    lazy_arrays[np_index] = da.from_delayed(
-                        delayed(TiffReader._imread)(self._file, scene_index, this_page_index),
-                        shape=sample.shape,
-                        dtype=sample.dtype
-                    )
-
-                # Convert the numpy array of lazy readers into a dask array
-                data = da.block(lazy_arrays.tolist())
-
-                # Only return the scene dimension if multiple scenes are present
-                if len(scenes) == 1:
-                    data = data[0, :]
-
-                # Set _dask_data
-                self._dask_data = data
+            # Load local Tiff scenes
+            else:
+                with TiffFile(self._file) as tiff:
+                    self._dask_data =  self._construct_dask_array(tiff)
 
         return self._dask_data
 
