@@ -9,6 +9,7 @@ from typing import List, Optional, Union
 import dask.array as da
 import numpy as np
 from dask import delayed
+from fsspec.spec import AbstractFileSystem
 from s3fs import S3File
 from tifffile import TiffFile
 
@@ -76,87 +77,32 @@ class TiffReader(Reader):
                     return False
             return True
 
-    @staticmethod
-    def _handle_imread(
-        tiff: TiffFile,
-        scene: int,
-        page: int
-    ) -> np.ndarray:
-        # Get proper scene
-        scene = tiff.series[scene]
-
-        # Get proper page
-        page = scene.pages[page]
-
-        # Return numpy
-        return page.asarray()
 
     @staticmethod
     def _imread(
-        img: Union[Path, S3File],
+        path: types.PathLike,
+        fs: Optional[AbstractFileSystem],
         scene: int,
         page: int
     ) -> np.ndarray:
-        # Load remote Tiff scenes
-        if isinstance(img, S3File):
-            with img.fs.open(img.path, "rb") as read_bytes:
-                with TiffFile(read_bytes) as tiff:
-                    return TiffReader._handle_imread(tiff, scene, page)
+        # Open buffer
+        buffer = Reader._get_buffer(path, fs)
 
-        # Load local Tiff scenes
-        else:
-            with TiffFile(img) as tiff:
-                return TiffReader._handle_imread(tiff, scene, page)
+        # Actual index operation
+        with TiffFile(buffer) as tiff:
+            # Get proper scene
+            scene = tiff.series[scene]
 
-    @staticmethod
-    def _construct_dask_array(pointer: Union[Path, S3File], tiff: TiffFile) -> da.core.Array:
-        # Check each scene has the same shape
-        # If scene shape checking fails, use the specified scene and update operating shape
-        scenes = tiff.series
-        operating_shape = scenes[0].shape
-        for scene in scenes:
-            if scene.shape != operating_shape:
-                operating_shape = scenes[self.specific_s_index].shape
-                scenes = [scenes[self.specific_s_index]]
-                log.info(
-                    f"File contains variable dimensions per scene, "
-                    f"selected scene: {self.specific_s_index} for data retrieval."
-                )
-                break
+            # Get proper page
+            page = scene.pages[page]
 
-        # Get sample yx plane
-        sample = scenes[0].pages[0].asarray()
+            # Return numpy
+            page = page.asarray()
 
-        # Combine length of scenes and operating shape
-        # Replace YX dims with empty dimensions
-        operating_shape = (len(scenes), *operating_shape)
-        operating_shape = operating_shape[:-2] + (1, 1)
+        # Close buffer
+        buffer.close()
 
-        # Make ndarray for lazy arrays to fill
-        lazy_arrays = np.ndarray(operating_shape, dtype=object)
-        for all_page_index, (np_index, _) in enumerate(np.ndenumerate(lazy_arrays)):
-            # Scene index is the first index in np_index
-            scene_index = np_index[0]
-
-            # This page index is current enumeration divided by scene index + 1
-            # For example if the image has 10 Z slices and 5 scenes, there would be 50 total pages
-            this_page_index = all_page_index // (scene_index + 1)
-
-            # Fill the numpy array with the delayed arrays
-            lazy_arrays[np_index] = da.from_delayed(
-                delayed(TiffReader._imread)(pointer, scene_index, this_page_index),
-                shape=sample.shape,
-                dtype=sample.dtype
-            )
-
-        # Convert the numpy array of lazy readers into a dask array
-        data = da.block(lazy_arrays.tolist())
-
-        # Only return the scene dimension if multiple scenes are present
-        if len(scenes) == 1:
-            data = data[0, :]
-
-        return data
+        return page
 
     @property
     def dask_data(self) -> da.core.Array:
@@ -169,87 +115,142 @@ class TiffReader(Reader):
             The constructed delayed YX plane dask array.
         """
         if self._dask_data is None:
-            # Load remote Tiff scenes
-            if isinstance(self._file, S3File):
-                with self._file.fs.open(self._file.path, "rb") as read_bytes:
-                    with TiffFile(read_bytes) as tiff:
-                        self._dask_data = self._construct_dask_array(self._file, tiff)
+            # Get buffer
+            buffer = self._get_buffer(self._file, self._fs)
 
-            # Load local Tiff scenes
-            else:
-                with TiffFile(self._file) as tiff:
-                    self._dask_data =  self._construct_dask_array(self._file, tiff)
+            # Actual index operation
+            with TiffFile(buffer) as tiff:
+                # Check each scene has the same shape
+                # If scene shape checking fails, use the specified scene and update operating shape
+                scenes = tiff.series
+                operating_shape = scenes[0].shape
+                for scene in scenes:
+                    if scene.shape != operating_shape:
+                        operating_shape = scenes[self.specific_s_index].shape
+                        scenes = [scenes[self.specific_s_index]]
+                        log.info(
+                            f"File contains variable dimensions per scene, "
+                            f"selected scene: {self.specific_s_index} for data retrieval."
+                        )
+                        break
+
+                # Get sample yx plane
+                sample = scenes[0].pages[0].asarray()
+
+                # Combine length of scenes and operating shape
+                # Replace YX dims with empty dimensions
+                operating_shape = (len(scenes), *operating_shape)
+                operating_shape = operating_shape[:-2] + (1, 1)
+
+                # Make ndarray for lazy arrays to fill
+                lazy_arrays = np.ndarray(operating_shape, dtype=object)
+                for all_page_index, (np_index, _) in enumerate(np.ndenumerate(lazy_arrays)):
+                    # Scene index is the first index in np_index
+                    scene_index = np_index[0]
+
+                    # This page index is current enumeration divided by scene index + 1
+                    # For example if the image has 10 Z slices and 5 scenes, there would be 50 total pages
+                    this_page_index = all_page_index // (scene_index + 1)
+
+                    # Fill the numpy array with the delayed arrays
+                    lazy_arrays[np_index] = da.from_delayed(
+                        delayed(TiffReader._imread)(self._file, self._fs, scene_index, this_page_index),
+                        shape=sample.shape,
+                        dtype=sample.dtype
+                    )
+
+                # Convert the numpy array of lazy readers into a dask array
+                data = da.block(lazy_arrays.tolist())
+
+                # Only return the scene dimension if multiple scenes are present
+                if len(scenes) == 1:
+                    data = data[0, :]
+
+                self._dask_data = data
+
+            # Close buffer
+            buffer.close()
 
         return self._dask_data
 
     def load_slice(self, slice_index: int = 0) -> np.ndarray:
-        with TiffFile(self._file) as tiff:
-            return tiff.asarray(key=slice_index)
+        # Get buffer
+        buffer = self._get_buffer(self._file, self._fs)
+
+        with TiffFile(buffer) as tiff:
+            result = tiff.asarray(key=slice_index)
+
+        # Close buffer
+        buffer.close()
+
+        return result
 
     def dtype(self):
         if self._dtype is None:
-            with TiffFile(self._file) as tiff:
+            # Get buffer
+            buffer = self._get_buffer(self._file, self._fs)
+
+            # Get dtype
+            with TiffFile(buffer) as tiff:
                 self._dtype = tiff.pages[0].dtype
+
+            # Close buffer
+            buffer.close()
 
         return self._dtype
 
-    @staticmethod
-    def _handle_dims(tiff: TiffFile) -> str:
-        single_scene_dims = tiff.series[0].pages.axes
-
-        # We can sometimes trust the dimension info in the image
-        if all([d in Dimensions.DefaultOrder for d in single_scene_dims]):
-            # Add scene dimension only if there are multiple scenes
-            if len(tiff.series) == 1:
-                dims = single_scene_dims
-            else:
-                dims = f"{Dimensions.Scene}{single_scene_dims}"
-        # Sometimes the dimension info is wrong in certain dimensions, so guess that dimension
-        else:
-            guess = TiffReader.guess_dim_order(tiff.series[0].pages.shape)
-            best_guess = []
-            for dim_from_meta in single_scene_dims:
-                if dim_from_meta in Dimensions.DefaultOrder:
-                    best_guess.append(dim_from_meta)
-                else:
-                    appended_dim = False
-                    for guessed_dim in guess:
-                        if guessed_dim not in best_guess:
-                            best_guess.append(guessed_dim)
-                            appended_dim = True
-                            log.info(
-                                f"Unsure how to handle dimension: {dim_from_meta}. "
-                                f"Replaced with guess: {guessed_dim}"
-                            )
-                            break
-
-                    # All of our guess dims were already in the dim list, append the dim read from meta
-                    if not appended_dim:
-                        best_guess.append(dim_from_meta)
-
-            best_guess = "".join(best_guess)
-
-            # Add scene dimension only if there are multiple scenes
-            if len(tiff.series) == 1:
-                dims = best_guess
-            else:
-                dims = f"{Dimensions.Scene}{best_guess}"
-
-        return dims
-
     @property
     def dims(self) -> str:
-        # Load remote Tiff scenes
-        if isinstance(self._file, S3File):
-            with self._file.fs.open(self._file.path, "rb") as read_bytes:
-                with TiffFile(read_bytes) as tiff:
-                    self._dims = TiffReader._handle_dims(tiff)
+        if self._dims is None:
+            # Get buffer
+            buffer = self._get_buffer(self._file, self._fs)
 
-        # Load local Tiff scenes
-        else:
-            with TiffFile(self._file) as tiff:
-                self._dims = TiffReader._handle_dims(tiff)
+            # Handle read dimensions
+            with TiffFile(buffer) as tiff:
+                single_scene_dims = tiff.series[0].pages.axes
 
+                # We can sometimes trust the dimension info in the image
+                if all([d in Dimensions.DefaultOrder for d in single_scene_dims]):
+                    # Add scene dimension only if there are multiple scenes
+                    if len(tiff.series) == 1:
+                        dims = single_scene_dims
+                    else:
+                        dims = f"{Dimensions.Scene}{single_scene_dims}"
+                # Sometimes the dimension info is wrong in certain dimensions, so guess that dimension
+                else:
+                    guess = TiffReader.guess_dim_order(tiff.series[0].pages.shape)
+                    best_guess = []
+                    for dim_from_meta in single_scene_dims:
+                        if dim_from_meta in Dimensions.DefaultOrder:
+                            best_guess.append(dim_from_meta)
+                        else:
+                            appended_dim = False
+                            for guessed_dim in guess:
+                                if guessed_dim not in best_guess:
+                                    best_guess.append(guessed_dim)
+                                    appended_dim = True
+                                    log.info(
+                                        f"Unsure how to handle dimension: {dim_from_meta}. "
+                                        f"Replaced with guess: {guessed_dim}"
+                                    )
+                                    break
+
+                            # All of our guess dims were already in the dim list, append the dim read from meta
+                            if not appended_dim:
+                                best_guess.append(dim_from_meta)
+
+                    best_guess = "".join(best_guess)
+
+                    # Add scene dimension only if there are multiple scenes
+                    if len(tiff.series) == 1:
+                        dims = best_guess
+                    else:
+                        dims = f"{Dimensions.Scene}{best_guess}"
+
+                self._dims = dims
+
+            # Close buffer
+            buffer.close()
 
         return self._dims
 
@@ -334,10 +335,17 @@ class TiffReader(Reader):
     @property
     def metadata(self) -> str:
         if self._metadata is None:
-            with open(self._file, "rb") as rb:
-                description = self.get_image_description(rb)
+            # Get buffer
+            buffer = self._get_buffer(self._file, self._fs)
+
+            # Get description
+            description = self.get_image_description(rb)
             if description is None:
                 self._metadata = ""
             else:
                 self._metadata = description.decode()
+
+            # Close buffer
+            buffer.close()
+
         return self._metadata

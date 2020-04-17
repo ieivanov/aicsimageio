@@ -11,13 +11,13 @@ from typing import Any, NamedTuple, Union
 
 import dask.array as da
 import numpy as np
-from s3fs import S3File
+from fsspec.spec import AbstractBufferedFile
 
 # Imaging Data Types
 SixDArray = np.ndarray  # In order STCZYX
 
 # IO Types
-PathLike = Union[str, Path, S3File]
+PathLike = Union[str, Path, AbstractBufferedFile]
 BufferLike = Union[bytes, BufferedIOBase]
 FileLike = Union[PathLike, BufferLike]
 ArrayLike = Union[np.ndarray, da.core.Array]

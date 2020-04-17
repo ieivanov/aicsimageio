@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import dask.array as da
 import numpy as np
+from fsspec.spec import AbstractBufferedFile, AbstractFileSystem
 from s3fs import S3File
 
 from .. import exceptions, types
@@ -28,7 +29,9 @@ class Reader(ABC):
     _metadata = None
 
     @staticmethod
-    def _resolve_image_path(img: Union[str, Path, S3File]) -> Union[Path, S3File]:
+    def _resolve_image_path(
+        img: types.PathLike
+    ) -> Union[Path, AbstractBufferedFile]:
         # Convert pathlike to Path
         if isinstance(img, (str, Path)):
             # Strictly do not fully resolve the path because Mac is bad with mounted drives
@@ -46,14 +49,14 @@ class Reader(ABC):
                 )
 
         # Check that no other type was provided
-        if not isinstance(img, (S3File, Path)):
+        if not isinstance(img, (AbstractBufferedFile, Path)):
             raise TypeError(
                 f"Please provide a path to a file as a string, or an pathlib.Path, to the "
                 f"`img` parameter. "
                 f"Received type: {type(img)}"
             )
 
-        # An S3File has already been validated on initialization so no need to check
+        # An AbstractBufferedFile has already been validated on initialization so no need to check
         return img
 
     def __init__(self, file: types.ImageLike, dask_kwargs: Dict[str, Any] = {}, **kwargs):
@@ -66,13 +69,33 @@ class Reader(ABC):
                 f"Reader does not support file or object: {file}"
             )
 
-        # Store this filepath
-        self._file = file
+        # Store this filepath in parts if ABF
+        if isinstance(file, AbstractBufferedFile):
+            self._file = file.path
+            self._fs = file.fs
+        # Store this filepath as whole if local
+        else:
+            self._file = file
+            self._fs = None
 
         # Store dask client and cluster setup
         self._dask_kwargs = dask_kwargs
         self._client = None
         self._cluster = None
+
+    @staticmethod
+    def _get_buffer(
+        path: Union[Path, AbstractBufferedFile], fs: Optional[AbstractFileSystem] = None
+    ) -> io.BufferedReader:
+        # Open remote
+        if fs is not None:
+            buffer = fs.open(path, "rb", fill_cache=False)
+
+        # Open local
+        else:
+            buffer = open(path, "rb")
+
+        return buffer
 
     @staticmethod
     def guess_dim_order(shape: Tuple[int]) -> str:
