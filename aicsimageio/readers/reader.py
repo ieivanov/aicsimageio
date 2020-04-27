@@ -89,6 +89,9 @@ class Reader(ABC):
     ) -> io.BufferedReader:
         # Open remote
         if fs is not None:
+            # fill cache tests
+            # True:  dask_data construction: 3min 58seconds, first plane get: 1min 56seconds
+            # False: dask_data construction: 3min 39seconds, first plane get: 1min 50seconds
             buffer = fs.open(path, "rb", fill_cache=False)
 
         # Open local
