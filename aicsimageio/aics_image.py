@@ -16,6 +16,7 @@ from .readers import (
     CziReader,
     DefaultReader,
     LifReader,
+    MicromanagerReader,
     OmeTiffReader,
     TiffReader,
 )
@@ -35,6 +36,7 @@ SUPPORTED_READERS = [
     ArrayLikeReader,
     CziReader,
     LifReader,
+    MicromanagerReader,
     OmeTiffReader,
     TiffReader,
     DefaultReader,
